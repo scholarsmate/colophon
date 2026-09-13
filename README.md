@@ -74,11 +74,16 @@ omarchy bar move ssandys.colophon --section left
 (`move` repositions a widget already in the bar layout; `put` only adds one
 that isn't there yet, so running `put` at this point would be a no-op.)
 
-**Authentication.** Start, stop, and restart act on a *system* unit, so
-**every** one of them raises Omarchy's authentication dialog — fingerprint if
-you have one enrolled, password otherwise. Expect one prompt per click, not
-one per login. Nothing to install, and Colophon can't touch the service
-without you approving each action.
+**Authentication.** By default Colophon acts on Ollama's *system* unit, so
+**every** start, stop, and restart raises Omarchy's authentication dialog —
+fingerprint if you have one enrolled, password otherwise. Expect one prompt
+per click, not one per login. Nothing to install, and Colophon can't touch
+the service without you approving each action.
+
+If Ollama is installed as `~/.config/systemd/user/ollama.service`, set the
+widget's **Ollama systemd service** setting to **User** instead. User-unit
+actions run through `systemctl --user` against your own systemd manager: no
+polkit, no dialog.
 
 ## Reading the bar
 
@@ -103,7 +108,8 @@ models, 19.7 GB` while not.
 - **Click an installed model** to warm it — this starts the server first if
   it isn't already up, waits for it to answer, then loads the model. If the
   server was stopped, this also raises the same authentication dialog as
-  clicking Start does. Starting the server and binding the port takes up to
+  clicking Start does when the System service scope is selected. Starting the
+  server and binding the port takes up to
   ~20 seconds; loading the model itself can take considerably longer for a
   large model on a cold page cache, and Colophon waits for that too rather
   than reporting a false timeout while the load is still quietly succeeding.
@@ -139,14 +145,16 @@ models, 19.7 GB` while not.
 ## Boot start
 
 Ollama's unit ships `disabled`, matching the on-demand design: the server
-shouldn't come up automatically at boot. The boot line under the status
-line shows the current state ("disabled at boot" / "enabled at boot")
-next to a switch — flip it to change whether `ollama.service` starts at
-boot.
+shouldn't come up automatically. The boot line under the status line shows
+the current state next to a switch — flip it to change whether
+`ollama.service` starts on its own. In System scope the label reads "at
+boot"; in User scope it reads "at login", or "at boot" once lingering is on
+(see below).
 
-Each flip raises the same authentication dialog as Start, Stop, and
-Restart — every time, not just the first. There's nothing remembered
-between clicks, so expect a prompt on every flip.
+In System scope, each flip raises the same authentication dialog as Start,
+Stop, and Restart — every time, not just the first. There's nothing
+remembered between clicks, so expect a prompt on every flip. User-scope
+flips raise no dialog.
 
 The switch only changes the boot setting, nothing else: enabling does not
 start the service right now, and disabling does not stop it. Use Start and
@@ -160,8 +168,24 @@ If you'd rather not use the switch, the equivalent terminal command still
 works:
 
 ```bash
-sudo systemctl enable ollama.service
+sudo systemctl enable ollama.service          # System scope
+systemctl --user enable ollama.service        # User scope
 ```
+
+**User scope and boot.** An enabled *user* unit is pulled in by
+`default.target` at session start: it starts when you log in, not when the
+machine boots. A reboot with nobody logged in — an SSH-only box, or
+connecting before anyone signs in — therefore finds no server running even
+though the switch says enabled. To have a user unit start before any login,
+enable lingering for your account:
+
+```bash
+loginctl enable-linger $USER
+```
+
+The widget's label reflects this: an enabled user unit reads "enabled at
+login", and only reads "enabled at boot" once `loginctl` reports lingering
+is on for your account.
 
 ## Configuration
 
@@ -182,6 +206,7 @@ model itself.
 | `pollIntervalIdleSec` | integer | 30 | 5–300 | Poll cadence while the panel is closed and the server is down (`stopped`, `failed`, or `missing`). |
 | `keepAliveMinutes` | integer | 5 | 1–120 | How long a model stays warm after loading, sent as `keep_alive` on every warm. |
 | `apiBase` | string | `http://127.0.0.1:11434` | — | Where Colophon probes for the Ollama API. |
+| `systemdScope` | enum | `System` | `System`, `User` | Which systemd manager owns `ollama.service`. User scope also defaults the model store to `~/.ollama/models`; System defaults it to `/var/lib/ollama`. An explicit `OLLAMA_MODELS` in the unit overrides either default. |
 | `showInstalledModels` | boolean | true | — | Show the installed-model list in the panel. |
 | `notifyServiceDied` | boolean | true | — | Desktop notification when the service dies unexpectedly. |
 
@@ -201,10 +226,19 @@ systemd genuinely has nothing running to report.
 ## Troubleshooting
 
 **"not authorized — the authentication prompt was dismissed or denied" when
-you click start, stop, or restart.** Omarchy's authentication dialog
-appeared and was cancelled, timed out, or the credential didn't match — not
-a missing setup step. Click the button again and complete the prompt
+you click start, stop, or restart in System scope.** Omarchy's authentication
+dialog appeared and was cancelled, timed out, or the credential didn't match —
+not a missing setup step. Click the button again and complete the prompt
 (fingerprint if you have one enrolled, password otherwise).
+
+**The panel says the unit is not found, but models still list below it.** The
+scope setting probably disagrees with where Ollama is actually installed:
+`missing` means "no `ollama.service` in the systemd manager you selected",
+not necessarily "Ollama isn't installed" — the model list reads the disk
+store either way, which is why it can look populated beside a red glyph. The
+tooltip names the scope it looked in. Set **Ollama systemd service** to
+**System** for `/usr/lib/systemd/system/ollama.service` (the usual
+install-all-users layout) or **User** for `~/.config/systemd/user/ollama.service`.
 
 **The widget looks stale or wrong after an update.** Quickshell doesn't
 re-create an already-running widget when the plugin's *structure* changes,

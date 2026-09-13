@@ -24,6 +24,7 @@ import colophon_collect as collect
 # "colophon_action.py")), and `action` here would silently shadow that local
 # rather than erroring -- see UnitNameTest.
 import colophon_action as action_mod
+import colophon_scope
 
 
 def read(*parts):
@@ -264,6 +265,102 @@ class SettingsDefaultTest(unittest.TestCase):
             with self.subTest(key=key):
                 self.assertIn(key, widget["defaults"])
                 self.assertIn(key, schema_keys)
+
+    def test_service_passes_the_scope_to_both_python_helpers(self):
+        # Call-site matching, not occurrence counting. The first version
+        # asserted `count('"--systemd-scope"') == 2` plus an assertIn --
+        # satisfied by ANY two occurrences, including both sitting inside
+        # runAction while refresh()'s collectProc.command reverted to its
+        # old form. The collector would then poll the system unit forever
+        # while the buttons acted on the user unit, and a guard named
+        # after both helpers stayed green. Extract each call site by its
+        # function and require the flag there.
+        source = read("Service.qml")
+        refresh_body = re.search(r"function refresh\(.*?\n  \}", source, re.S)
+        self.assertIsNotNone(refresh_body,
+                             "refresh() not found in Service.qml")
+        action_body = re.search(r"function runAction\(.*?\n  \}",
+                                source, re.S)
+        self.assertIsNotNone(action_body,
+                             "runAction() not found in Service.qml")
+        for name, body in (("refresh", refresh_body.group(0)),
+                          ("runAction", action_body.group(0))):
+            with self.subTest(function=name):
+                self.assertEqual(
+                    body.count('"--systemd-scope", root.systemdScope'), 1,
+                    name + " must pass the scope to its helper exactly once")
+        # And in refresh() the pair must sit inside the collectProc.command
+        # literal itself -- a flag parked in dead code elsewhere in the
+        # function would satisfy the count but spawn the wrong command.
+        self.assertRegex(
+            refresh_body.group(0),
+            r"collectProc\.command\s*=\s*\[[^\]]*\"--systemd-scope\",\s*"
+            r"root\.systemdScope[^\]]*\]")
+
+
+class ScopeVocabularyTest(unittest.TestCase):
+    """The scope crosses every boundary at once: manifest label -> QML
+    property -> CLI flag -> both Python scripts.
+
+    CONTRIBUTING.md trap #12 is exactly this shape. colophon_scope.py is the
+    single declaration (the two scripts re-export it), and these are the
+    guards that make a one-sided edit fail instead of shipping a collector
+    and an action helper that disagree about which unit they address.
+    """
+
+    def test_manifest_options_fold_to_the_shared_scopes(self):
+        widget = load_manifest()["barWidget"]
+        entries = [entry for entry in widget["schema"]
+                   if entry["key"] == "systemdScope"]
+        self.assertEqual(len(entries), 1,
+                         "systemdScope schema entry missing or duplicated")
+        # Options are menu LABELS ("System", "User"); the scripts speak
+        # lowercase. Folding must land on the shared tuple exactly.
+        self.assertEqual(tuple(option.lower()
+                               for option in entries[0]["options"]),
+                         colophon_scope.SYSTEMD_SCOPES)
+        self.assertEqual(entries[0]["defaultValue"].lower(),
+                         colophon_scope.DEFAULT_SYSTEMD_SCOPE)
+        self.assertEqual(widget["defaults"]["systemdScope"].lower(),
+                         colophon_scope.DEFAULT_SYSTEMD_SCOPE)
+
+    def test_both_scripts_share_one_scope_declaration(self):
+        # Identity, not just equality: two local tuples that happen to
+        # agree today are the drift trap this file exists for. Both scripts
+        # re-export colophon_scope's objects, so `is` holds -- re-declaring
+        # a local copy fails here even while every value still matches.
+        self.assertIs(action_mod.SYSTEMD_SCOPES, collect.SYSTEMD_SCOPES)
+        self.assertIs(action_mod.SYSTEMD_SCOPES, colophon_scope.SYSTEMD_SCOPES)
+        self.assertIs(action_mod.DEFAULT_SYSTEMD_SCOPE,
+                      collect.DEFAULT_SYSTEMD_SCOPE)
+        self.assertIs(action_mod.SCOPE_FLAG, colophon_scope.SCOPE_FLAG)
+        self.assertIs(collect.SCOPE_FLAG, colophon_scope.SCOPE_FLAG)
+
+    def test_neither_script_re_spells_the_flag_as_a_local_literal(self):
+        # The parsers must compare against the shared constant. A re-sprouted
+        # "--systemd-scope" string in one script is precisely the one-sided
+        # edit that leaves the other script silently ignoring the flag.
+        for name in ("scripts/colophon_action.py",
+                     "scripts/colophon_collect.py"):
+            with self.subTest(script=name):
+                source = read(name)
+                self.assertNotIn('"--systemd-scope"', source)
+                self.assertIn("SCOPE_FLAG", source)
+
+    def test_qml_sanitises_the_scope_before_any_helper_sees_it(self):
+        # A non-string systemdScope used to throw inside the binding, the
+        # property resolved to "", and every poll and click died against the
+        # helpers' guard with no way back. String() plus a whitelist of the
+        # folded names is the widget's half of the contract; assert its
+        # shape so a revert to a bare toLowerCase() is caught here.
+        source = read("Service.qml")
+        binding = re.search(r"property string systemdScope:\s*\{(.*?)\n  \}",
+                            source, re.S)
+        self.assertIsNotNone(binding,
+                             "systemdScope binding not found in Service.qml")
+        self.assertRegex(binding.group(1), r"String\\?\s*\(",
+                         "the binding must String() the raw setting")
+        self.assertIn('=== "user" ? "user" : "system"', binding.group(1))
 
 
 class KindRoutingTest(unittest.TestCase):

@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import subprocess
@@ -38,6 +39,41 @@ class PlanTest(unittest.TestCase):
                                 "http://127.0.0.1:11434", False),
                     ["/usr/bin/systemctl " + verb + " ollama.service"])
 
+    def test_user_scope_adds_the_user_manager_flag(self):
+        self.assertEqual(
+            action.plan("start", "", "generate", 5,
+                        "http://127.0.0.1:11434", False,
+                        systemd_scope="user"),
+            ["/usr/bin/systemctl --user start ollama.service"])
+
+    def test_the_scope_is_case_folded_not_matched_raw(self):
+        # The manifest's menu labels are "System" and "User". A comparison
+        # that matched only lowercase made `systemctl_command("start",
+        # "User")` fall through to the SYSTEM command: an action against a
+        # unit nobody selected, polkit prompt included, with no error.
+        self.assertEqual(action.systemctl_command("start", "User"),
+                         ["/usr/bin/systemctl", "--user", "start",
+                          "ollama.service"])
+        self.assertEqual(action.systemctl_command("start", " SYSTEM "),
+                         ["/usr/bin/systemctl", "start", "ollama.service"])
+
+    def test_an_unknown_scope_is_rejected_not_defaulted(self):
+        # Same incident: the command builders must never quietly hand back
+        # the system command for a scope they do not recognise. main()
+        # validates the CLI, so this guard is for every other caller.
+        # (Whitespace and case are folded, so "User " is legitimate -- see
+        # the case-fold test above -- and only genuinely wrong names fail.)
+        for bad in ("session", "", "userx", "sys", "users", "system user"):
+            with self.subTest(scope=bad):
+                self.assertRaises(ValueError, action.systemctl_command,
+                                  "start", bad)
+        # A bool or number has no scope meaning at all: same ValueError,
+        # not an AttributeError from string methods on a non-string.
+        for bad in (True, 1, None, ["user"]):
+            with self.subTest(scope=repr(bad)):
+                self.assertRaises(ValueError, action.systemctl_command,
+                                  "start", bad)
+
     def test_the_prompt_is_never_suppressed(self):
         # --no-ask-password sets allow_interactive_authorization=false on the
         # D-Bus call, which turns Omarchy's authentication dialog into a bare
@@ -53,10 +89,17 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(action.SYSTEMCTL_VERBS,
                          action.LIFECYCLE_VERBS + action.BOOT_VERBS,
                          "SYSTEMCTL_VERBS must cover every systemctl verb")
-        for verb in action.SYSTEMCTL_VERBS:
-            with self.subTest(verb=verb):
+        # Iterated over scope too: scope is a second dimension every verb
+        # now crosses. `--no-ask-password` in the user branch only (a
+        # plausible edit -- a user unit genuinely needs no polkit agent)
+        # turns every user-scope action into a silent "Access denied" while
+        # a verbs-only guard stays green.
+        for verb, scope in itertools.product(action.SYSTEMCTL_VERBS,
+                                             action.SYSTEMD_SCOPES):
+            with self.subTest(verb=verb, scope=scope):
                 self.assertNotIn(
-                    "--no-ask-password", action.systemctl_command(verb),
+                    "--no-ask-password",
+                    action.systemctl_command(verb, scope),
                     "the prompt must not be suppressed -- see "
                     "docs/superpowers/specs/2026-08-11-prompted-privilege-design.md")
 
@@ -144,6 +187,13 @@ class DryRunTest(unittest.TestCase):
             result.stdout.strip(),
             "/usr/bin/systemctl start ollama.service")
 
+    def test_user_scope_dry_run_prints_the_user_command(self):
+        result = run(["start", "--systemd-scope", "user", "--dry-run"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(),
+            "/usr/bin/systemctl --user start ollama.service")
+
     def test_dry_run_prints_the_maximal_warm_plan(self):
         # A dry run performs no I/O, so it cannot know whether the server is
         # up; it prints the full plan, which is what a reviewer needs to see.
@@ -153,19 +203,45 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(len(lines), 3)
 
     def test_dry_run_never_touches_the_service(self):
+        # Probes pin SYSTEMCTL (/usr/bin/systemctl), not PATH's systemctl:
+        # the production command builders pin that path, and a probe
+        # resolving a different binary would compare the wrong unit's
+        # state -- green suite, untouched-or-touched reality unknown.
         before = subprocess.run(
-            ["systemctl", "is-active", "ollama.service"],
+            [action.SYSTEMCTL, "is-active", "ollama.service"],
             capture_output=True, text=True).stdout.strip()
         for args in (["start"], ["stop"], ["restart"],
                      ["warm", "llama3.2:3b"], ["unload", "llama3.2:3b"]):
             run(args + ["--dry-run"])
         after = subprocess.run(
-            ["systemctl", "is-active", "ollama.service"],
+            [action.SYSTEMCTL, "is-active", "ollama.service"],
+            capture_output=True, text=True).stdout.strip()
+        self.assertEqual(before, after)
+
+    def test_dry_run_never_touches_the_user_service(self):
+        # The user-scope twin of the test above, and a twin in fact: this
+        # ran only `restart` while its system twin looped every verb, so a
+        # future early-return that let `stop` or `warm` bypass the dry-run
+        # gate in user scope would get caught in system scope and ship
+        # unguarded in user scope.
+        before = subprocess.run(
+            [action.SYSTEMCTL, "--user", "is-active", "ollama.service"],
+            capture_output=True, text=True).stdout.strip()
+        for args in (["start"], ["stop"], ["restart"],
+                     ["warm", "llama3.2:3b"], ["unload", "llama3.2:3b"]):
+            run(args + ["--systemd-scope", "user", "--dry-run"])
+        after = subprocess.run(
+            [action.SYSTEMCTL, "--user", "is-active", "ollama.service"],
             capture_output=True, text=True).stdout.strip()
         self.assertEqual(before, after)
 
 
 class ArgumentTest(unittest.TestCase):
+    def test_an_unknown_systemd_scope_exits_two(self):
+        result = run(["start", "--systemd-scope", "session", "--dry-run"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("system or user", result.stderr)
+
     def test_an_unknown_verb_exits_two(self):
         result = run(["frobnicate", "--dry-run"])
         self.assertEqual(result.returncode, 2)
@@ -279,21 +355,41 @@ class LoopbackGuardTest(unittest.TestCase):
             self.addCleanup(setattr, action, name, getattr(action, name))
             setattr(action, name, value)
 
-    def warm(self, api_base):
-        """Run execute('warm') against api_base; return (code, started)."""
+    def warm(self, api_base, systemd_scope=None):
+        """Run execute('warm') against api_base; return (code, started).
+
+        started records (verb, scope) pairs: the stub must accept the scope
+        execute now threads through it (a `lambda verb:` stub TypeErrored
+        the moment run_systemctl gained the parameter -- which is exactly
+        how threading regressions get caught rather than papered over), and
+        recording it lets an assertion pin WHICH manager warm would start.
+        """
         started = []
+        kwargs = {} if systemd_scope is None else {"systemd_scope": systemd_scope}
         self.stub(api_reachable=lambda *a, **k: False,
-                  run_systemctl=lambda verb: started.append(verb) or 0,
+                  run_systemctl=lambda verb, scope=None: (
+                      started.append((verb, scope)) or 0),
                   wait_for_api=lambda *a, **k: True,
                   post_json=lambda *a, **k: 0)
-        code = action.execute("warm", "llama3.2:3b", "generate", 5, api_base)
+        code = action.execute("warm", "llama3.2:3b", "generate", 5,
+                              api_base, **kwargs)
         return code, started
 
     def test_a_loopback_base_may_still_start_the_local_unit(self):
         code, started = self.warm("http://127.0.0.1:11434")
 
         self.assertEqual(code, 0)
-        self.assertEqual(started, ["start"])
+        # Default scope, threaded all the way to the manager-selection
+        # argument: the pair, not just the verb -- a stub that dropped the
+        # scope and always started the system unit is the bug this records.
+        self.assertEqual(started, [("start", "system")])
+
+    def test_warm_starts_the_unit_in_the_selected_scope(self):
+        code, started = self.warm("http://127.0.0.1:11434",
+                                  systemd_scope="user")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(started, [("start", "user")])
 
     def test_a_remote_base_never_starts_the_local_unit(self):
         code, started = self.warm("http://10.0.0.9:11434")

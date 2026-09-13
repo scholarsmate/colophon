@@ -162,6 +162,25 @@ Item {
   readonly property int idleInterval: setting("pollIntervalIdleSec", 30)
   readonly property int keepAliveMinutes: setting("keepAliveMinutes", 5)
   readonly property string apiBase: setting("apiBase", "http://127.0.0.1:11434")
+  // String() before toLowerCase(): shell.json is hand-editable, and a
+  // `"systemdScope": true` leaves .toLowerCase undefined on the bool -- the
+  // binding threw, the property resolved to "", and EVERY poll and every
+  // click then died against the helpers' scope guard ("must be system or
+  // user") with no way back except editing the config by hand. Anything that
+  // is not "user" is system, the documented default, so a garbage value
+  // degrades to the default scope instead of bricking the widget.
+  readonly property string systemdScope: {
+    var value = String(root.setting("systemdScope", "System")).toLowerCase()
+    return value === "user" ? "user" : "system"
+  }
+  // Re-poll the moment the scope flips, not up to one idle interval later:
+  // the panel is about to describe a DIFFERENT unit, and a stale System-scope
+  // status sitting there reads as the setting doing nothing. Coalesced
+  // refresh (no `true`): if a poll is in flight it was started with the old
+  // scope, and pendingRefresh makes the first post-change poll happen as
+  // soon as that one lands. False death alerts across the switch are gated
+  // where they belong -- handleOutput's scope comparison -- not by rushing.
+  onSystemdScopeChanged: Qt.callLater(root.refresh)
   readonly property bool showInstalledModels: setting("showInstalledModels", true)
   readonly property bool notifyServiceDied: setting("notifyServiceDied", true)
   // The poll timer's LIVE interval, read-only, for
@@ -182,7 +201,8 @@ Item {
     root.pendingRefresh = false
     root.loading = true
     collectProc.command = ["python3", root.collectPath,
-                           "--api-base", root.apiBase]
+                           "--api-base", root.apiBase,
+                           "--systemd-scope", root.systemdScope]
     collectProc.running = true
   }
 
@@ -197,6 +217,19 @@ Item {
 
     root.nowSec = Date.now() / 1000
     var previous = root.dataVersion > 0 ? root.status : ""
+    // The scope the RETAINED snapshot was collected under. Switching
+    // System/User selects a different unit: the previous status belongs to
+    // the old one, so the first snapshot under the new scope reporting
+    // stopped or missing is not a death -- without this gate it fired a
+    // critical "ollama.service is no longer running" toast for a service
+    // nobody stopped, through the `failed` branch too. Comparing the
+    // payload's scope is race-free against a mid-poll change: every
+    // snapshot carries the scope it was actually collected under, so only
+    // a transition observed within one and the same unit reaches
+    // death detection, and detection resumes on the next same-scope poll.
+    // Absent-on-both (an old fixture) compares equal and still detects.
+    var previousScope = root.dataVersion > 0
+        ? String(root.snapshot.systemdScope || "") : ""
     if (next.status !== root.status || root.dataVersion === 0) {
       root.status = next.status
       root.statusSinceSec = root.nowSec
@@ -224,8 +257,12 @@ Item {
     if (root.optimisticBootState !== "" && root.actionInProgress === "")
       root.optimisticBootState = ""
 
-    // Suppressed on the first snapshot, so shell startup is silent.
-    if (previous !== "") checkForDeath(previous, next)
+    // Suppressed on the first snapshot, so shell startup is silent. A
+    // snapshot collected under a different scope than the retained one is
+    // also suppressed -- that transition describes switching which unit we
+    // look at, not the old unit dying. See previousScope above.
+    if (previous !== "" && previousScope === String(next.systemdScope || ""))
+      checkForDeath(previous, next)
   }
 
   function checkForDeath(previous, next) {
@@ -353,6 +390,7 @@ Item {
     var args = ["python3", root.actionPath, verb]
     if (target) args.push(target)
     args.push("--api-base", root.apiBase)
+    args.push("--systemd-scope", root.systemdScope)
     if (extraArgs) for (var j = 0; j < extraArgs.length; j++) args.push(extraArgs[j])
     if (verb === "warm") args.push("--keep-alive", String(root.keepAliveMinutes))
     if (kind) args.push("--kind", kind)

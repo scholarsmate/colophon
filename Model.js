@@ -39,6 +39,11 @@ var EMPTY_SNAPSHOT = {
   schema: 1,
   status: "stopped",
   error: "",
+  // The scope a real snapshot always carries (colophon_collect.collect):
+  // which systemd manager it described, and whether that manager starts
+  // before a login. Defaults here mirror the manifest's default scope.
+  systemdScope: "system",
+  linger: null,
   unit: { name: "ollama.service", loadState: "", activeState: "",
           subState: "", unitFileState: "", result: "", startedAt: null,
           nRestarts: 0, memoryBytes: null },
@@ -141,9 +146,18 @@ function coerceUnitFileState(unitFileState) {
                 ? "" : unitFileState)
 }
 
-function bootLabel(unitFileState) {
+function bootLabel(unitFileState, systemdScope, linger) {
   var state = coerceUnitFileState(unitFileState)
   if (state === "") return ""
+  // An enabled USER unit is pulled in by default.target at SESSION start --
+  // it survives to boot time only with `loginctl enable-linger`. Rendering
+  // "enabled at boot" regardless of scope was the UI repeating a promise the
+  // switch cannot keep: flip it in User scope, reboot, SSH in, find nothing
+  // running. Only a verified linger (collector's loginctl probe) lets the
+  // boot word back in; unknown lingers on the claim that is true either way.
+  // System scope is unchanged: there, "at boot" is simply what enable does.
+  if (state === "enabled" && String(systemdScope || "") === "user")
+    return linger === true ? "enabled at boot" : "enabled at login"
   // hasOwnProperty.call, not a bare BOOT_LABELS[state]: a bare lookup walks the
   // prototype chain, so a state named "constructor" or "toString" returns an
   // inherited function instead of falling through to the raw value below.
@@ -357,10 +371,40 @@ function canRestart(status, actionInProgress) {
   return status === "running" || status === "failed"
 }
 
-function actionDisabledReason(status) {
+// The two ways a unit is "missing" are different problems with different
+// fixes, and conflating them is what made the new scope setting so easy to
+// mis-hit: picking User while Ollama is installed system-wide reported
+// "ollama.service is not installed" straight above a list of four models
+// read from ~/.ollama/models -- a flat contradiction on screen. The
+// collector's data separates them: `systemctl show` answers
+// LoadState=not-found for a unit this manager does not have (wrong scope
+// choice -- and the manifest setting is the fix, so name it), while a
+// loaded-but-dead unit or a unit-less machine points at the binary.
+function missingCauseText(snapshot) {
+  var unit = (snapshot && snapshot.unit) || {}
+  var scope = String((snapshot && snapshot.systemdScope) || "")
+  if (unit.loadState === "not-found") {
+    var named = (scope === "user" || scope === "system")
+        ? scope + " scope" : "selected scope"
+    return "ollama.service not found in the " + named +
+           " \u2014 set the Ollama systemd service setting to the scope that " +
+           "owns it (System: /usr/lib/systemd/system, User: " +
+           "~/.config/systemd/user)"
+  }
+  // The unit file is there (or the payload predates the field) but the
+  // probe found no `ollama` on PATH.
+  return "ollama.service is not installed: the ollama binary was not " +
+         "found on PATH"
+}
+
+function actionDisabledReason(status, snapshot) {
   if (status === "foreign")
     return "Started outside ollama.service — systemd cannot stop it"
-  if (status === "missing") return "ollama.service is not installed"
+  // Without a snapshot the old generic wording stands: the single-argument
+  // call is a supported shape (asserted in tests/model.test.js).
+  if (status === "missing")
+    return snapshot ? missingCauseText(snapshot)
+                    : "ollama.service is not installed"
   return ""
 }
 
@@ -385,7 +429,9 @@ function actionErrorText(stderr) {
 function tooltipText(snapshot, nowSec) {
   if (!snapshot) return "Colophon"
   var status = snapshot.status
-  if (status === "missing") return "ollama.service not found"
+  // Not a bare "not found": in User scope that message, beside a populated
+  // model list, was a dead end with nothing naming the scope setting.
+  if (status === "missing") return missingCauseText(snapshot)
 
   var api = snapshot.api || {}
   var version = api.serverVersion || api.clientVersion || ""

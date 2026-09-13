@@ -195,6 +195,66 @@ test("bootLabel labels enabled and disabled, and hides the line when empty", () 
   assert.equal(Model.bootLabel(""), "")
 })
 
+test("bootLabel tells login from boot in user scope", () => {
+  // System scope is unchanged: there, enable genuinely is start-at-boot.
+  assert.equal(Model.bootLabel("enabled", "system", null), "enabled at boot")
+  assert.equal(Model.bootLabel("enabled", "system", true), "enabled at boot")
+  // A user unit is pulled in by default.target at session start; only a
+  // verified linger (collector's loginctl probe === true) earns the boot
+  // word. false AND unknown both read "at login" -- the claim that is true
+  // either way; rendering "at boot" on unknown would repeat the exact
+  // false promise (reboot, SSH in, nothing running) this branch exists
+  // to retire.
+  assert.equal(Model.bootLabel("enabled", "user", true), "enabled at boot")
+  assert.equal(Model.bootLabel("enabled", "user", false), "enabled at login")
+  assert.equal(Model.bootLabel("enabled", "user", null), "enabled at login")
+  assert.equal(Model.bootLabel("enabled", "user"), "enabled at login")
+  // disabled promises nothing, so it is left alone in either scope.
+  assert.equal(Model.bootLabel("disabled", "user", null), "disabled at boot")
+  // Unknown states still render raw, with or without scope (the
+  // prototype-chain guard in bootLabel must not be bypassed by the new
+  // branch -- bootLabel is reached with these extra args from Panel.qml).
+  assert.equal(Model.bootLabel("enabled-runtime", "user", false),
+               "enabled until reboot")
+  assert.equal(Model.bootLabel("toString", "user", true), "toString")
+})
+
+test("missing reasons name the scope rather than cry 'not installed'", () => {
+  // The misconfiguration the scope setting makes easy to hit: User chosen
+  // while Ollama is system-installed. The panel must say WHERE it looked,
+  // not flatten "no unit in this manager" into "not installed" beside a
+  // populated model list.
+  const wrongScope = withStatus("missing")
+  wrongScope.systemdScope = "user"
+  wrongScope.unit.loadState = "not-found"
+  const reason = Model.actionDisabledReason("missing", wrongScope)
+  assert.match(reason, /user scope/)
+  assert.match(reason, /Ollama systemd service setting/)
+  assert.doesNotMatch(reason, /is not installed/)
+  // The tooltip carries the same diagnosis -- this was the dead end.
+  assert.match(Model.tooltipText(wrongScope, 0), /user scope/)
+
+  // Unit file present (loadState "loaded", inherited from RUNNING) but no
+  // binary: a different problem, a different message.
+  const noBinary = withStatus("missing")
+  noBinary.systemdScope = "user"
+  assert.match(Model.actionDisabledReason("missing", noBinary),
+               /ollama binary was not found on PATH/)
+
+  // An unknown scope on an absent unit degrades to "selected scope", never
+  // to a claim about a manager nobody named.
+  const noScope = withStatus("missing")
+  noScope.unit.loadState = "not-found"
+  delete noScope.systemdScope
+  assert.match(Model.actionDisabledReason("missing", noScope),
+               /selected scope/)
+
+  // The single-argument shape keeps its old generic wording: documented as
+  // supported (and asserted above), even though Panel.qml always passes
+  // the snapshot now.
+  assert.match(Model.actionDisabledReason("missing"), /not installed/)
+})
+
 test("tooltipText summarises each state", () => {
   assert.match(Model.tooltipText(RUNNING, 1786726840),
                /ollama 0\.32\.6 · up 14m · llama3\.2:3b loaded \(GPU\)/)

@@ -1,6 +1,8 @@
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -44,10 +46,135 @@ class ModelsRootTest(unittest.TestCase):
     def test_falls_back_when_unset(self):
         self.assertEqual(collect.models_root({}), "/var/lib/ollama")
 
+    def test_user_source_falls_back_to_the_user_model_store(self):
+        source = collect.LiveSource("http://127.0.0.1:11434", "user")
+        self.assertEqual(source.models_root({}),
+                         os.path.expanduser("~/.ollama/models"))
+
     def test_falls_back_on_unbalanced_quotes(self):
         # shlex raises on this; the fallback must not crash the poll.
         show = {"Environment": 'OLLAMA_MODELS="/srv/models'}
         self.assertEqual(collect.models_root(show), "/var/lib/ollama")
+
+
+class LiveSourceScopeTest(unittest.TestCase):
+    """The scope must survive all the way into the systemctl command.
+
+    The only user-scope CLI test ran the fixture path, which used to drop
+    the scope, and this class's predecessor covered only models_root. Delete
+    the `--user` append in show_text and the entire suite stayed green while
+    the widget reported the SYSTEM unit's state in User scope -- the half of
+    the feature the collector exists to provide. These pin the command
+    itself, with subprocess stubbed so nothing real is queried.
+    """
+
+    def recorded_show_command(self, scope):
+        calls = []
+
+        class Completed(object):
+            returncode = 0
+            stdout = "LoadState=loaded\nActiveState=inactive\n"
+            stderr = ""
+
+        def fake_run(command, **kwargs):
+            calls.append(list(command))
+            return Completed()
+
+        original = collect.subprocess.run
+        self.addCleanup(setattr, collect.subprocess, "run", original)
+        collect.subprocess.run = fake_run
+        source = collect.LiveSource("http://127.0.0.1:11434", scope)
+        source.show_text()
+        self.assertEqual(len(calls), 1, "show_text should run systemctl once")
+        return calls[0]
+
+    def test_user_scope_puts_dash_user_before_show(self):
+        command = self.recorded_show_command("user")
+        self.assertEqual(command[:3],
+                         ["/usr/bin/systemctl", "--user", "show"])
+        self.assertIn("ollama.service", command)
+
+    def test_system_scope_gets_no_user_flag(self):
+        command = self.recorded_show_command("system")
+        self.assertNotIn("--user", command)
+        self.assertEqual(command[:2], ["/usr/bin/systemctl", "show"])
+
+    def test_the_manifest_capitalisation_is_accepted(self):
+        # The manifest label is "User"; a raw comparison against lowercase
+        # read the system unit for a caller that had selected User.
+        command = self.recorded_show_command("User")
+        self.assertEqual(command[:3],
+                         ["/usr/bin/systemctl", "--user", "show"])
+
+    def test_an_unknown_scope_raises_at_construction(self):
+        # Not defaulted to system: an unrecognised scope addressing the
+        # unit nobody chose is the bug; raising is the fix.
+        self.assertRaises(ValueError, collect.LiveSource,
+                          "http://127.0.0.1:11434", "session")
+        self.assertRaises(ValueError, collect.LiveSource,
+                          "http://127.0.0.1:11434", True)
+
+    def record_linger_run(self, scope, answer, returncode=0):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, returncode,
+                                               stdout=answer, stderr="")
+
+        original = collect.subprocess.run
+        self.addCleanup(setattr, collect.subprocess, "run", original)
+        collect.subprocess.run = fake_run
+        source = collect.LiveSource("http://127.0.0.1:11434", scope)
+        return source, calls
+
+    def test_linger_yes_is_true(self):
+        source, calls = self.record_linger_run("user", "yes\n")
+        self.assertIs(source.linger(), True)
+        self.assertEqual(calls[0][:2], ["/usr/bin/loginctl", "show-user"])
+        self.assertIn("--property=Linger", calls[0])
+
+    def test_linger_no_is_false(self):
+        source, _ = self.record_linger_run("user", "no")
+        self.assertIs(source.linger(), False)
+
+    def test_system_scope_never_probes_linger(self):
+        # A system unit starts at boot whatever the account says, and the
+        # loginctl round trip is pure waste there.
+        source, calls = self.record_linger_run("system", "yes")
+        self.assertIsNone(source.linger())
+        self.assertEqual(calls, [])
+
+    def test_a_failing_or_unparseable_loginctl_is_unknown_not_false(self):
+        # Unknown degrades to "enabled at login", the honest claim; False
+        # would claim the unit does NOT start at boot -- a new wrong promise.
+        source, _ = self.record_linger_run("user", "no", returncode=1)
+        self.assertIsNone(source.linger())
+        source, _ = self.record_linger_run("user", "perhaps")
+        self.assertIsNone(source.linger())
+
+
+class FixtureLingerTest(unittest.TestCase):
+    """linger.txt: an optional, replays-like-I-am probe of loginctl."""
+
+    def source_with_linger(self, content):
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        if content is not None:
+            with open(os.path.join(directory, "linger.txt"), "w") as handle:
+                handle.write(content)
+        return collect.FixtureSource(directory, "http://127.0.0.1:11434",
+                                     "user")
+
+    def test_absent_file_means_unknown(self):
+        self.assertIsNone(self.source_with_linger(None).linger())
+
+    def test_yes_and_no_are_parsed(self):
+        self.assertIs(self.source_with_linger("yes\n").linger(), True)
+        self.assertIs(self.source_with_linger("no").linger(), False)
+
+    def test_garbage_degrades_to_unknown_not_crash(self):
+        self.assertIsNone(self.source_with_linger("maybe").linger())
 
 
 class MemoryBytesTest(unittest.TestCase):
@@ -788,6 +915,28 @@ class CommandLineTest(unittest.TestCase):
         result = self.run_cli("stopped", ["--wat"])
         self.assertEqual(result.returncode, 2)
         self.assertIn("unknown argument", result.stderr)
+
+    def test_an_unknown_systemd_scope_exits_two(self):
+        result = self.run_cli(
+            "stopped", ["--systemd-scope", "session"])
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("system or user", result.stderr)
+
+    def test_user_systemd_scope_is_accepted_and_reaches_the_payload(self):
+        # Not just "the CLI survived the flag": main() used to drop
+        # systemd_scope on the fixture path, so this returned 0 whether or
+        # not the scope went anywhere and the user-scope plumbing looked
+        # covered while nothing reached the snapshot. The payload echo is
+        # what makes the assertion prove the wiring.
+        result = self.run_cli("stopped", ["--systemd-scope", "user"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["systemdScope"], "user")
+
+    def test_default_scope_is_echoed_as_system(self):
+        result = self.run_cli("stopped")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["systemdScope"], "system")
 
     def test_a_broken_fixture_exits_one_with_a_message(self):
         env = dict(os.environ)

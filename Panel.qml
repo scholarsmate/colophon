@@ -329,7 +329,8 @@ Panel {
           Text {
             textFormat: Text.PlainText
             id: bootText
-            text: Model.bootLabel(root.snap.unit ? root.snap.unit.unitFileState : "")
+            text: Model.bootLabel(root.snap.unit ? root.snap.unit.unitFileState : "",
+                                  root.snap.systemdScope, root.snap.linger)
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -370,7 +371,13 @@ Panel {
             // readonly alias for that purpose.
             PanelToolTip {
               visible: bootSwitch.containsMouse
-              text: "Start ollama.service at boot -- does not start it now"
+              // A user unit starts at session start, not boot (linger is the
+              // exception, and Model.bootLabel/collector linger cover the
+              // verified case). The tooltip must not promise what the switch
+              // cannot deliver in the selected scope.
+              text: root.snap.systemdScope === "user"
+                    ? "Start ollama.service at login -- does not start it now"
+                    : "Start ollama.service at boot -- does not start it now"
               fontFamily: root.fontFamily
             }
           }
@@ -378,8 +385,8 @@ Panel {
 
         Text {
           textFormat: Text.PlainText
-          visible: Model.actionDisabledReason(root.status) !== ""
-          text: Model.actionDisabledReason(root.status)
+          visible: Model.actionDisabledReason(root.status, root.snap) !== ""
+          text: Model.actionDisabledReason(root.status, root.snap)
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -401,7 +408,7 @@ Panel {
                      root.status !== "foreign"
             text: "start"
             foreground: "#22c55e"
-            tooltipText: Model.actionDisabledReason(root.status) ||
+            tooltipText: Model.actionDisabledReason(root.status, root.snap) ||
                          "Start ollama.service"
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
@@ -417,7 +424,7 @@ Panel {
                      root.status === "foreign"
             text: "stop"
             foreground: root.fg
-            tooltipText: Model.actionDisabledReason(root.status) ||
+            tooltipText: Model.actionDisabledReason(root.status, root.snap) ||
                          "Stop ollama.service"
             fontFamily: root.fontFamily
             fontSize: Style.font.caption
@@ -432,7 +439,7 @@ Panel {
             visible: root.status !== "stopped" && root.status !== "missing"
             text: "restart"
             foreground: root.fg
-            tooltipText: Model.actionDisabledReason(root.status) ||
+            tooltipText: Model.actionDisabledReason(root.status, root.snap) ||
                          "Restart ollama.service"
             fontFamily: root.fontFamily
             fontSize: Style.font.caption

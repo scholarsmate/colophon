@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Collect one Ollama status snapshot and print it as JSON.
 
+  colophon_collect.py [--api-base URL] [--systemd-scope system|user]
+
+Default scope is `system`; `user` addresses ~/.config/systemd/user/
+ollama.service through `systemctl --user` and falls the model store back to
+~/.ollama/models. Neither helper implements --help, so this docstring is the
+usage reference -- keep it honest.
+
 All read I/O lives here. Every transform is a module-level function taking
 plain dicts so it can be tested without touching systemd, the network, or the
 filesystem. Stdlib only, no pip -- this is what lets the collector run with
@@ -57,7 +64,8 @@ import re
 import shlex
 import stat
 
-DEFAULT_MODELS_ROOT = "/var/lib/ollama"
+DEFAULT_SYSTEM_MODELS_ROOT = "/var/lib/ollama"
+DEFAULT_USER_MODELS_ROOT = os.path.expanduser("~/.ollama/models")
 
 # systemd's "this property has no value" sentinel for unsigned integers.
 UINT64_MAX = 18446744073709551615
@@ -120,18 +128,18 @@ def parse_show(text):
     return result
 
 
-def models_root(show):
+def models_root(show, fallback=DEFAULT_SYSTEM_MODELS_ROOT):
     """Where the model store lives, per the unit's own Environment."""
     raw = (show or {}).get("Environment", "")
     try:
         tokens = shlex.split(raw)
     except ValueError:
         # Unbalanced quotes must not take the whole poll down.
-        return DEFAULT_MODELS_ROOT
+        return fallback
     for token in tokens:
         if token.startswith("OLLAMA_MODELS="):
             return token.split("=", 1)[1]
-    return DEFAULT_MODELS_ROOT
+    return fallback
 
 
 def memory_bytes(show):
@@ -445,11 +453,20 @@ import time
 # PYTHONSAFEPATH in the user's environment would otherwise drop it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import colophon_http
+import colophon_scope
 
 SCHEMA_VERSION = 1
 DEFAULT_API_BASE = "http://127.0.0.1:11434"
 SYSTEMCTL = "/usr/bin/systemctl"
 OLLAMA = "ollama"
+LOGINCTL = "/usr/bin/loginctl"
+# Declared once in colophon_scope.py, re-exported here (CONTRIBUTING.md trap
+# #12): the action helper and the collector must never disagree about which
+# scopes exist, what the flag is called, or when `--user` goes on the
+# systemctl command line.
+SYSTEMD_SCOPES = colophon_scope.SYSTEMD_SCOPES
+DEFAULT_SYSTEMD_SCOPE = colophon_scope.DEFAULT_SYSTEMD_SCOPE
+SCOPE_FLAG = colophon_scope.SCOPE_FLAG
 
 SHOW_TIMEOUT_SEC = 5
 API_TIMEOUT_SEC = 2
@@ -496,15 +513,25 @@ def parse_client_version(text):
 
 
 class LiveSource(object):
-    def __init__(self, api_base):
+    def __init__(self, api_base, systemd_scope=DEFAULT_SYSTEMD_SCOPE):
         self.api_base = api_base
+        # Normalised at the boundary, not at every use: the manifest's label
+        # is "User", and `"User" == "user"` failing used to have this class
+        # read the SYSTEM unit -- and report the system model store -- for a
+        # caller that had selected User. Anything genuinely unknown raises
+        # here rather than defaulting to system downstream.
+        self.systemd_scope = colophon_scope.normalize_scope(systemd_scope)
         self._show = None
+        self._linger = None
 
     def show_text(self):
         if self._show is not None:
             return self._show
-        command = [SYSTEMCTL, "show", UNIT_NAME,
-                   "--property=" + ",".join(SHOW_PROPERTIES), "--no-pager"]
+        command = [SYSTEMCTL]
+        command.extend(colophon_scope.systemctl_scope_args(self.systemd_scope))
+        command.extend(("show", UNIT_NAME,
+                        "--property=" + ",".join(SHOW_PROPERTIES),
+                        "--no-pager"))
         try:
             completed = subprocess.run(command, capture_output=True, text=True,
                                        timeout=SHOW_TIMEOUT_SEC)
@@ -545,7 +572,39 @@ class LiveSource(object):
                                     (completed.stderr or ""))
 
     def models_root(self, show):
-        return models_root(show)
+        fallback = (DEFAULT_USER_MODELS_ROOT
+                    if self.systemd_scope == "user"
+                    else DEFAULT_SYSTEM_MODELS_ROOT)
+        return models_root(show, fallback)
+
+    def linger(self):
+        """Does systemd start the user manager at boot for this account?
+
+        An enabled USER unit is pulled in by default.target at session start;
+        it only runs before any login when lingering is on. The boot switch
+        must not promise "at boot" for a user unit that will not be there on
+        a headless boot, and only loginctl knows. Meaningful in user scope
+        only: system scope returns None and the label stays "at boot".
+        Cached like _show -- it cannot change within one snapshot.
+        """
+        if self.systemd_scope != "user":
+            return None
+        if self._linger is not None:
+            return self._linger
+        try:
+            completed = subprocess.run(
+                [LOGINCTL, "show-user", "--property=Linger", "--value",
+                 "--no-pager"],
+                capture_output=True, text=True, timeout=SHOW_TIMEOUT_SEC)
+        except (OSError, subprocess.SubprocessError):
+            # No loginctl (or it timed out): report unknown, and Model.js
+            # falls back to the claim that is true either way -- "at login".
+            return None
+        answer = (completed.stdout or "").strip().lower()
+        if completed.returncode != 0 or answer not in ("yes", "no"):
+            return None
+        self._linger = answer == "yes"
+        return self._linger
 
 
 class FixtureSource(object):
@@ -557,9 +616,15 @@ class FixtureSource(object):
     special marker.
     """
 
-    def __init__(self, directory, api_base):
+    def __init__(self, directory, api_base, systemd_scope=DEFAULT_SYSTEMD_SCOPE):
         self.directory = directory
         self.api_base = api_base
+        # Carried, not dropped: main() used to hand the parsed scope to
+        # LiveSource only, so the fixture-selected CLI path silently ignored
+        # --systemd-scope and the "user scope is accepted" test proved
+        # nothing at all. The payload now echoes it for both sources, and
+        # tests/test_collect.py pins that echo end to end.
+        self.systemd_scope = colophon_scope.normalize_scope(systemd_scope)
 
     def _path(self, name):
         return os.path.join(self.directory, name)
@@ -589,6 +654,21 @@ class FixtureSource(object):
         except OSError:
             return None
 
+    def linger(self):
+        # Optional linger.txt holding "yes"/"no": a fixture replays state,
+        # it does not run loginctl. Absent means unknown, exactly like a
+        # live host without loginctl.
+        try:
+            with open(self._path("linger.txt")) as handle:
+                answer = handle.read().strip().lower()
+        except OSError:
+            return None
+        if answer == "yes":
+            return True
+        if answer == "no":
+            return False
+        return None
+
     def models_root(self, show):
         # A state directory may carry its own tree; otherwise every state
         # shares tests/fixtures/models, so the inventory is not duplicated
@@ -616,6 +696,13 @@ def collect(source, now_sec, uptime_sec):
         "schema": SCHEMA_VERSION,
         "status": status,
         "error": None,
+        # Which manager this snapshot describes, and whether that manager
+        # even starts before a login. Model.js needs both to speak honestly:
+        # the same "missing" status is a wrong-scope setting in one case and
+        # an absent binary in the other, and an enabled user unit is "at
+        # login", not "at boot", until lingering is on.
+        "systemdScope": source.systemd_scope,
+        "linger": source.linger(),
         "unit": unit,
         "api": {
             "base": source.api_base,
@@ -637,19 +724,28 @@ def collect(source, now_sec, uptime_sec):
 
 def main(argv):
     api_base = DEFAULT_API_BASE
+    systemd_scope = DEFAULT_SYSTEMD_SCOPE
     args = list(argv)
     while args:
         arg = args.pop(0)
         if arg == "--api-base" and args:
             api_base = args.pop(0)
+        elif arg == SCOPE_FLAG and args:
+            systemd_scope = args.pop(0)
         else:
             sys.stderr.write(
                 "colophon_collect: unknown argument '" + arg + "'\n")
             return 2
 
+    try:
+        systemd_scope = colophon_scope.normalize_scope(systemd_scope)
+    except ValueError as error:
+        sys.stderr.write("colophon_collect: " + str(error) + "\n")
+        return 2
+
     fixture = os.environ.get("COLOPHON_FIXTURE", "")
-    source = (FixtureSource(fixture, api_base) if fixture
-              else LiveSource(api_base))
+    source = (FixtureSource(fixture, api_base, systemd_scope) if fixture
+              else LiveSource(api_base, systemd_scope))
     try:
         snapshot = collect(source, time.time(), uptime_seconds())
     except CollectError as error:

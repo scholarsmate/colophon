@@ -52,6 +52,24 @@ def quickshell_missing():
     return shutil.which("quickshell") is None
 
 
+def run_harness(script, check, wait=1500):
+    """Run a throwaway ShellRoot against the real Service.qml; return proc."""
+    with tempfile.TemporaryDirectory() as tmp:
+        for name in ("Service.qml", "Model.js", "qmldir"):
+            shutil.copy(os.path.join(ROOT, name), os.path.join(tmp, name))
+        harness = os.path.join(tmp, "harness.qml")
+        with open(harness, "w") as handle:
+            handle.write(HARNESS % {"script": script, "check": check,
+                                    "wait": wait})
+        empty_bin = os.path.join(tmp, "empty-bin")
+        os.mkdir(empty_bin)
+        env = dict(os.environ)
+        env["PATH"] = empty_bin
+        return subprocess.run([shutil.which("quickshell"), "-p", harness],
+                              capture_output=True, text=True,
+                              timeout=30, env=env)
+
+
 @unittest.skipIf(quickshell_missing(), "quickshell is required to run Service.qml")
 class SettingsDeliveryTest(unittest.TestCase):
     """Settings reaching the singleton at all (#19).
@@ -64,20 +82,7 @@ class SettingsDeliveryTest(unittest.TestCase):
     """
 
     def _run(self, script, check, wait=1500):
-        with tempfile.TemporaryDirectory() as tmp:
-            for name in ("Service.qml", "Model.js", "qmldir"):
-                shutil.copy(os.path.join(ROOT, name), os.path.join(tmp, name))
-            harness = os.path.join(tmp, "harness.qml")
-            with open(harness, "w") as handle:
-                handle.write(HARNESS % {"script": script, "check": check,
-                                        "wait": wait})
-            empty_bin = os.path.join(tmp, "empty-bin")
-            os.mkdir(empty_bin)
-            env = dict(os.environ)
-            env["PATH"] = empty_bin
-            return subprocess.run([shutil.which("quickshell"), "-p", harness],
-                                  capture_output=True, text=True,
-                                  timeout=30, env=env)
+        return run_harness(script, check, wait)
 
     def test_with_no_settings_the_service_uses_its_defaults(self):
         # The control. Every assertion below is about a value DIFFERENT from
@@ -242,6 +247,82 @@ class WidgetWiringTest(unittest.TestCase):
         self.assertNotIn("settings", body,
                          "attach() must not latch settings: the first surface "
                          "attaches holding the empty default (#19)")
+
+
+@unittest.skipIf(quickshell_missing(), "quickshell is required to run Service.qml")
+class DeathDetectionTest(unittest.TestCase):
+    """checkForDeath must describe one unit, not two.
+
+    Switching the systemdScope setting selects a DIFFERENT unit while the
+    widget stays alive: the retained status belongs to the old one, so the
+    first snapshot under the new scope -- `stopped` or `failed` because the
+    other manager has no ollama.service -- used to fire the critical
+    "ollama.service is no longer running" notification for a service nobody
+    stopped. handleOutput gates death detection on the two snapshots
+    agreeing on the scope each was collected under; these pin that gate in
+    BOTH directions. The positive control matters as much as the negative:
+    without it, a gate that simply never fires (a compare against a field
+    that never exists) passes every "no false alert" assertion while also
+    silencing the alerts the feature exists to raise.
+    """
+
+    ARM = ("Service.attach({}); root.idleMs = 0;"
+           " Service.onServiceDied.connect("
+           "function (reason) { root.idleMs = 1; });")
+
+    def snapshot(self, status, scope):
+        return ("Service.handleOutput(JSON.stringify({ status: '%s',"
+                " systemdScope: '%s', unit: { loadState: 'loaded' } }));"
+                % (status, scope))
+
+    def test_a_scope_switch_is_not_reported_as_a_death(self):
+        # running under System, then the first User-scope snapshot: the
+        # transition describes which unit we look at, not the old one dying.
+        proc = run_harness(
+            self.ARM + self.snapshot("running", "system")
+            + self.snapshot("stopped", "user"),
+            "Service.status === 'stopped' && root.idleMs === 0")
+        self.assertEqual(proc.returncode, 0,
+                         "the scope switch fired a death alert\n%s%s"
+                         % (proc.stdout, proc.stderr))
+
+    def test_a_switch_onto_a_failed_unit_is_not_reported_either(self):
+        # The reviewer's second route: switching back onto a unit in `failed`
+        # alerted through the failed branch, not just running -> stopped.
+        proc = run_harness(
+            self.ARM + self.snapshot("running", "system")
+            + self.snapshot("failed", "user"),
+            "Service.status === 'failed' && root.idleMs === 0")
+        self.assertEqual(proc.returncode, 0,
+                         "switching onto a failed unit alerted\n%s%s"
+                         % (proc.stdout, proc.stderr))
+
+    def test_a_real_death_in_one_scope_still_alerts(self):
+        # Positive control: same scope, running -> stopped, expectedStop
+        # false -- the exact condition the notification exists for. If this
+        # goes red, the gate has become a mute and the negative tests above
+        # are vacuous.
+        proc = run_harness(
+            self.ARM + self.snapshot("running", "system")
+            + self.snapshot("stopped", "system"),
+            "Service.status === 'stopped' && root.idleMs === 1")
+        self.assertEqual(proc.returncode, 0,
+                         "a real death was silenced\n%s%s"
+                         % (proc.stdout, proc.stderr))
+
+    def test_detection_resumes_after_the_switch_settles(self):
+        # After the switch, the retained snapshot IS the user unit; a real
+        # user-scope death on the following poll must alert. (Proves the
+        # gate is per-transition and self-clearing, not a latch.)
+        proc = run_harness(
+            self.ARM + self.snapshot("running", "system")
+            + self.snapshot("stopped", "user")
+            + self.snapshot("running", "user")
+            + self.snapshot("stopped", "user"),
+            "root.idleMs === 1")
+        self.assertEqual(proc.returncode, 0,
+                         "detection stayed suppressed after the switch\n%s%s"
+                         % (proc.stdout, proc.stderr))
 
 
 if __name__ == "__main__":
