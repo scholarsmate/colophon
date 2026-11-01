@@ -436,13 +436,15 @@ def scan_installed(root):
     return (entries, sum(seen.values()))
 
 
-import http.client
 import subprocess
 import shutil
 import sys
 import time
-import urllib.error
-import urllib.request
+
+# The script's own directory, explicitly: Service.qml runs this by path, and
+# PYTHONSAFEPATH in the user's environment would otherwise drop it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import colophon_http
 
 SCHEMA_VERSION = 1
 DEFAULT_API_BASE = "http://127.0.0.1:11434"
@@ -473,16 +475,13 @@ def api_get(api_base, path, timeout):
     url = str(api_base).rstrip("/") + path
     started = time.monotonic()
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            # timeout bounds how long this waits, not how much it accepts. A
-            # local port is not automatically a trusted one: while the unit is
-            # stopped, any process on this machine can bind 11434 and answer.
-            body = response.read(MAX_API_BYTES + 1)
-            if len(body) > MAX_API_BYTES:
-                return (None, None)
-            payload = json.loads(body.decode("utf-8"))
-    except (urllib.error.URLError, http.client.HTTPException, OSError,
-            ValueError, TimeoutError):
+        # A local port is not automatically a trusted one: while the unit is
+        # stopped, any process on this machine can bind 11434 and answer.
+        # colophon_http refuses redirects unread, never reads an error body,
+        # and bounds this body by MAX_API_BYTES and by `timeout` end to end.
+        body = colophon_http.fetch(url, timeout, MAX_API_BYTES)
+        payload = json.loads(body.decode("utf-8"))
+    except (colophon_http.FetchError, ValueError):
         return (None, None)
     # Same check _read_json makes, for the same reason: every caller unwraps
     # this with .get(), and json.loads is happy to return a list or a string.

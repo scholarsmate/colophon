@@ -199,7 +199,10 @@ target.
 this listing update rather than after. Reads now go through `os.open` with
 `O_NOFOLLOW` and `O_NONBLOCK` plus an `fstat` `S_ISREG` check and a byte cap; a
 layer digest must match `sha256-[0-9a-f]{64}` before it becomes a path; models,
-field lengths and both HTTP bodies are capped. Nine tests cover it, each
+field lengths and both HTTP bodies are capped. Since v0.5.1 that cap holds
+for every byte read off the socket, not only the final response: redirects are
+refused unread, error bodies are read only to a one-line limit, and each request
+has a wall-clock deadline (CONTRIBUTING.md trap #51). Nine tests cover it, each
 verified to fail or hang against the unhardened reader. The write half of that
 review does not apply at all: Colophon performs no filesystem write anywhere,
 which is now stated in `LICENSE` and is worth saying plainly if asked.

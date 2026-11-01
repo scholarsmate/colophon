@@ -18,17 +18,20 @@ lookup; duplicating it here is exactly the kind of hand-copied cross-language
 logic that fails silently on a one-sided edit.
 """
 
-import http.client
 import ipaddress
 import json
 import math
+import os
 import re
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+
+# The script's own directory, explicitly: Service.qml runs this by path, and
+# PYTHONSAFEPATH in the user's environment would otherwise drop it.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import colophon_http
 
 UNIT_NAME = "ollama.service"
 SYSTEMCTL = "/usr/bin/systemctl"
@@ -80,6 +83,9 @@ LOAD_POST_TIMEOUT_SEC = 300
 # large, and a timeout bounds how long we wait rather than how much we accept.
 MAX_API_BYTES = 1 << 20
 MAX_ERROR_DETAIL_CHARS = 512
+# Enough bytes for MAX_ERROR_DETAIL_CHARS of UTF-8 and no more: the rest of an
+# error body is never read off the socket.
+MAX_ERROR_DETAIL_BYTES = MAX_ERROR_DETAIL_CHARS * 4
 
 POLL_SLEEP_SEC = 0.5
 
@@ -173,11 +179,9 @@ def plan(verb, target, kind, keep_alive_min, api_base, running, params=None):
 def api_reachable(api_base, timeout=API_TIMEOUT_SEC):
     url = str(api_base).rstrip("/") + "/api/version"
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            response.read(MAX_API_BYTES)
+        colophon_http.fetch(url, timeout, MAX_API_BYTES)
         return True
-    except (urllib.error.URLError, http.client.HTTPException, OSError,
-            ValueError, TimeoutError):
+    except colophon_http.FetchError:
         return False
 
 
@@ -192,36 +196,23 @@ def wait_for_api(api_base, deadline_sec):
 
 def post_json(url, body):
     payload = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=payload, headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=LOAD_POST_TIMEOUT_SEC) as response:
-            response.read(MAX_API_BYTES)
+        colophon_http.fetch(url, LOAD_POST_TIMEOUT_SEC, MAX_API_BYTES,
+                            data=payload,
+                            headers={"Content-Type": "application/json"},
+                            detail_bytes=MAX_ERROR_DETAIL_BYTES)
         return 0
-    except urllib.error.HTTPError as error:
-        # Surface the API's own message: this is how a warm against the wrong
-        # endpoint for an unusual model family reports itself, rather than
-        # silently doing nothing.
-        detail = ""
-        try:
-            with error:
-                detail = (error.read(MAX_API_BYTES)
-                          .decode("utf-8", "replace").strip()
-                          [:MAX_ERROR_DETAIL_CHARS])
-        except (http.client.HTTPException, OSError):
-            # Reading the error body can itself hit IncompleteRead, which is
-            # an HTTPException and NOT an OSError -- the same gap that let a
-            # raw traceback escape api_get in the collector. `with error:`
-            # also makes sure the response is closed either way, instead of
-            # relying on garbage collection to do it.
-            pass
-        sys.stderr.write("colophon: " + url + " returned " + str(error.code)
-                         + (": " + detail if detail else "") + "\n")
-        return 1
-    except (urllib.error.URLError, http.client.HTTPException, OSError,
-            ValueError, TimeoutError) as error:
-        sys.stderr.write("colophon: could not reach " + url + ": "
-                         + str(error) + "\n")
+    except colophon_http.FetchError as error:
+        if error.code is not None:
+            # Surface the API's own message: this is how a warm against the
+            # wrong endpoint for an unusual model family reports itself,
+            # rather than silently doing nothing.
+            detail = error.detail[:MAX_ERROR_DETAIL_CHARS]
+            sys.stderr.write("colophon: " + url + " returned "
+                             + str(error.code)
+                             + (": " + detail if detail else "") + "\n")
+        else:
+            sys.stderr.write("colophon: " + str(error) + "\n")
         return 1
 
 
